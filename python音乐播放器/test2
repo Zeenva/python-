@@ -1,0 +1,561 @@
+import sys,math
+import requests
+import jsonpath
+import os
+import sqlite3
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLineEdit, QListWidget, QVBoxLayout, QWidget, QLabel, QSlider,QMessageBox,QHBoxLayout,QMenu,QSpacerItem,QSizePolicy
+from PyQt5.QtCore import Qt,QUrl,QTimer
+from PyQt5.QtGui import QDesktopServices,QIcon,QPalette,QColor,QPixmap,QBrush
+
+import pygame
+from mutagen.mp3 import MP3
+
+class SongDatabase:
+    def __init__(self, db_path='songs.db'):
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()   #创建一个游标对象来返回数据库结果
+        self.create_table()
+
+    def create_table(self):
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS songs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                author TEXT,
+                url TEXT
+            )
+        ''')
+        self.conn.commit()
+
+    def add_song(self, title, author, url):
+        self.cursor.execute('''
+            INSERT INTO songs (title, author, url) VALUES (?, ?, ?)
+        ''', (title, author, url))
+        self.conn.commit()
+    
+    def check_song_exist(self, title, author):
+        query = f"SELECT * FROM songs WHERE title = '{title}' AND author = '{author}'"
+        self.cursor.execute(query)
+        result = self.cursor.fetchone()
+        if result:
+            return True
+        else:
+            return False
+
+    def get_all_songs(self):
+        self.cursor.execute('SELECT * FROM songs')
+        return self.cursor.fetchall()
+
+    def get_song_by_id(self, song_id):
+        self.cursor.execute('SELECT * FROM songs WHERE id = ?', (song_id,))
+        return self.cursor.fetchone()
+
+    def get_previous_song(self, current_id):
+        self.cursor.execute('SELECT * FROM songs WHERE id < ? ORDER BY id DESC LIMIT 1', (current_id,))
+        return self.cursor.fetchone()
+
+    def get_next_song(self, current_id):
+        self.cursor.execute('SELECT * FROM songs WHERE id > ? ORDER BY id ASC LIMIT 1', (current_id,))
+        return self.cursor.fetchone()
+
+    def close(self):
+        self.conn.close()
+
+
+class MusicDownloader(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+
+        self.db = SongDatabase()
+        
+        self.setWindowTitle('音乐播放器')
+        self.setGeometry(100, 100, 900, 600)
+        self.setup_ui()
+        
+        pygame.mixer.init()
+        self.platfrom = "netease"
+        self.title=''
+        self.author=''
+        self.song_url=''
+        self.headers=''
+        self.url=''
+        self.paused = False                                           #self.paused变量，用于实现进度条实时展示，不会出现进度条自动清零的情况
+
+        self.pause_icon = QIcon("pause_icon.png")
+        self.resume_icon = QIcon("resume_icon.png")
+        self.previous_icon = QIcon("previous_icon.png")
+        self.next_icon = QIcon("next_icon.png")
+        
+        
+
+        self.is_playing = False                                      #self.is_playing变量，用于实现暂停→继续按钮的变化
+        self.current_song = None  
+        self.play_error= False 
+        self.current_index = None
+        
+                                      
+        
+
+
+    def setup_ui(self):
+        self.central_widget = QWidget(self)
+        self.setCentralWidget(self.central_widget)
+        
+        #设置背景图片
+        pixmap = QPixmap("background_icon.png")
+        palette = QPalette()
+        palette.setBrush(QPalette.Background, QBrush(pixmap))
+        self.setPalette(palette)
+
+
+        self.search_label = QLabel("搜索歌曲：")
+        self.search_input = QLineEdit()
+        self.search_button = QPushButton("搜索")
+        self.search_button.clicked.connect(self.search_music)  #连接搜索类
+        self.search_input.returnPressed.connect(self.search_music)   #回车键搜索
+        
+
+        #显示搜索出来的表单数据
+        self.music_list = QListWidget()
+        self.music_list_label = QLabel("搜索歌曲：")
+        self.music_list.itemDoubleClicked.connect(self.song_download)#通过双击，连接到下载类
+
+        
+        #搜索歌单布局
+        self.music_list_layout = QVBoxLayout()
+        self.music_list_layout.addWidget(self.music_list_label)
+        self.music_list_layout.addWidget(self.music_list)
+
+        #搜索布局
+        self.search_layout = QHBoxLayout()
+        self.search_layout.addWidget(self.search_label)
+        self.search_layout.addWidget(self.search_input)
+        self.search_layout.addWidget(self.search_button)
+        
+        #已下载歌单
+        self.downloaded_music_list_label = QLabel("已下载歌曲：")
+        self.downloaded_music_list = QListWidget()
+        self.downloaded_music_list.itemDoubleClicked.connect(self.play_downloaded_music)
+
+        #删除下载表单内容
+        self.downloaded_music_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.downloaded_music_list.customContextMenuRequested.connect(self.show_context_menu)
+
+
+        #下载表单布局
+        self.downloaded_music_list_layout = QVBoxLayout()
+        self.downloaded_music_list_layout.addWidget(self.downloaded_music_list_label)
+        self.downloaded_music_list_layout.addWidget(self.downloaded_music_list)
+        
+        #两个表单的的布局
+        self.list_layout = QHBoxLayout()
+        self.list_layout.addLayout(self.downloaded_music_list_layout)
+        self.list_layout.addLayout(self.music_list_layout)
+
+
+        #更新下载列表
+        self.update_downloaded_music_list()
+        
+        #上部分布局
+        self.layout = QVBoxLayout()
+        self.layout.addLayout(self.search_layout)
+        self.layout.addLayout(self.list_layout)
+
+       
+        self.central_widget.setLayout(self.layout)
+
+        #时间函数，用于实现进度条
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_progress)
+        
+        #暂停按钮
+        self.pause_button = QPushButton()
+        self.pause_icon = QIcon("pause_icon.png")
+        self.pause_button.setIcon(self.pause_icon)
+        self.pause_button.clicked.connect(self.pause_resume_music)
+
+        #音量设置
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setMinimum(0)
+        self.volume_slider.setMaximum(100)
+        self.volume_slider.setValue(50)
+        self.volume_label = QLabel("音量：50")
+        self.volume_slider.valueChanged.connect(self.adjust_volume)
+
+        #音量的布局
+        self.volume_layout = QHBoxLayout() 
+        spacer_item = QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.volume_layout.addItem(spacer_item)
+        self.volume_layout.addWidget(self.volume_label)
+        self.volume_layout.addWidget(self.volume_slider)
+        #self.volume_layout.addWidget(self.volume_label)
+        
+
+        # 上一首按钮
+        self.previous_song_button = QPushButton()
+        self.previous_icon = QIcon("previous_icon.png")
+        self.previous_song_button.setIcon(self.previous_icon)
+        self.previous_song_button.clicked.connect(self.play_previous_song)
+
+        # 下一首按钮
+        self.next_song_button = QPushButton("")
+        self.next_icon = QIcon("next_icon.png")
+        self.next_song_button.setIcon(self.next_icon)
+        self.next_song_button.clicked.connect(self.play_next_song)
+
+        #一些可视化的菜单显示
+        self.status_label = QLabel()
+        self.current_music_label = QLabel()
+
+        #功能布局
+        self.function_layout = QHBoxLayout()
+        self.function_layout.setAlignment(Qt.AlignCenter)
+        self.function_layout.addWidget(self.previous_song_button)
+        self.function_layout.addWidget(self.pause_button)
+        self.function_layout.addWidget(self.next_song_button)
+        #self.function_layout.addLayout(self.volume_layout)
+        
+
+        #下半部分布局
+        self.down_layout = QVBoxLayout()
+        self.down_layout.addLayout(self.function_layout)
+        self.down_layout.addLayout(self.volume_layout)
+       
+ 
+        #歌曲进度条
+        self.progress_slider = QSlider(Qt.Horizontal)
+        self.progress_slider.setMinimum(0)
+        self.progress_slider.setMaximum(100)
+        self.progress_slider.sliderMoved.connect(self.set_progress)
+        self.progress_label = QLabel()
+
+        self.progress_layout = QHBoxLayout()
+        self.progress_layout.addWidget(self.progress_slider)
+        self.progress_layout.addWidget(self.progress_label)
+
+        #主要布局
+        self.layout.addWidget(self.status_label)
+        self.layout.addWidget(self.current_music_label)
+        self.layout.addLayout(self.progress_layout)
+        self.layout.addLayout(self.down_layout)
+        
+        
+        
+        self.central_widget.setLayout(self.layout)
+
+        self.pause_button.setObjectName("pauseButton")
+        self.search_button.setObjectName("searchButton")
+        self.previous_song_button.setObjectName("previousButton")
+        self.next_song_button.setObjectName("nextButton")
+        self.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                color: #FFFFFF;
+            }
+            QMessageBox QLabel {
+                color: #000000; /* 设置消息框文本颜色为黑色 */
+            }
+           
+            QPushButton {
+                font-size: 14px;
+                color: #FFFFFF;
+                background-color: rgba(0, 150, 136, 0.8); /* 半透明的按钮背景 */
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 150, 136, 1); /* 鼠标悬停时不透明 */
+            }
+            QLineEdit, QListWidget {
+                font-size: 14px;
+                padding: 8px;
+                background-color: rgba(255, 255, 255, 0.5); /* 半透明白色背景 */
+                border: 1px solid #cccccc;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #009688; /* 滑块颜色 */
+                border: 1px solid #009688;
+                width: 18px;
+                margin-top: -2px;
+                margin-bottom: -2px;
+                border-radius: 9px;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #bbbbbb;
+                height: 10px;
+                background: #e0e0e0;
+                margin: 0 20px;
+            }
+        """)
+   
+
+    #搜索功能
+    def search_music(self):
+        self.status_label.setText("正在搜索...")
+        QApplication.processEvents()
+            
+        name = self.search_input.text()   
+
+        self.url = 'https://music.liuzhijin.cn/'  #搜索网站的URL
+
+        self.headers = {                           #充当浏览器（一个模拟浏览器的增强，若直接爬取该网址可能会遭到该网站的阻截或反爬取）
+            "user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36",
+            "x-requested-with":"XMLHttpRequest",
+        }
+        param = {                             #查取网页的关键信息，搜索功能的data数据，实现爬取功能
+            "input":name,  #输入搜索关键词
+            "filter":"name",
+            "type":self.platfrom,
+            "page": 1,
+        }
+        res = requests.post(url=self.url,data=param,headers=self.headers)   #设置一个post对象,爬取信息
+        json_text = res.json()           #将爬取的信息存入到json_text
+
+        #设置对象，tittle、author、song_rul
+        self.title = jsonpath.jsonpath(json_text,'$..title')
+        self.author = jsonpath.jsonpath(json_text,'$..author')
+        self.song_url = jsonpath.jsonpath(json_text, '$..url')
+
+        #通过关键词搜索
+        if self.title:
+            self.music_list.clear()#清空music_list列表，用于刷新
+            songs = list(zip(self.title, self.author,self.song_url))   #利用zip整合爬取的内容，self.title, self.author,self.song_url
+            for s in songs:
+                self.music_list.addItem(f"{s[0]} - {s[1]}")  #将list转变成字典
+        else:
+            self.music_list.clear()
+            self.music_list.addItem("对不起，暂无搜索结果!")
+   
+
+    #下载音乐
+    def song_download(self,item):
+        index = self.music_list.indexFromItem(item).row()#创建下标变量，用于储存，然后实现播放功能
+        name = self.music_list.item(index).text()
+        self.title, self.author = name.split(" - ")
+
+        param = {                            #歌曲的data数据
+            "input":self.title,#搜索关键词
+            "filter":"name",
+            "type":"netease",
+            "page": 1,
+        }
+        res = requests.post(url=self.url,data=param,headers=self.headers)
+        json_text = res.json()
+        url = jsonpath.jsonpath(json_text, '$..url')[index]
+        self.title = self.title.replace('/', '_')
+        self.status_label.setText("正在下载...")
+        QApplication.processEvents()  #
+
+        music_dir = "music"
+        if not os.path.exists(music_dir):
+          os.makedirs(music_dir)
+
+        
+        file_path = os.path.join(music_dir, f"{self.title}-{self.author}.mp3")
+        with open(file_path, 'wb') as w:
+            w.write(requests.get(url).content)
+        self.status_label.setText("下载成功")
+        QApplication.processEvents() 
+
+        if not self.db.check_song_exist(self.title, self.author):            #判断是否存在文件，若不存在则添加至数据库中
+            self.db.add_song(self.title, self.author, url)
+
+        self.update_downloaded_music_list()
+            
+
+        song = {                     #将self.tittle,self,author存入字典song，因为list格式不允许字符串和str在一起的形式，会发生报错
+        "title": self.title,
+        "author": self.author
+    }  
+        
+        self.play_music(song)
+
+    #播放音乐   
+    def play_music(self,song):
+        self.current_song = song   #传入song字典，且定义全局类self.current_song
+        try:                   #抛出错误，若下载到损坏文件或者该音乐需要VIP则直接抛出
+            pygame.init()
+            file_path = os.path.join("music", f"{song['title']}-{song['author']}.mp3")
+            if not os.path.exists(file_path):
+                QMessageBox.warning(self, "错误", "该音乐文件不存在")
+                return
+            pygame.mixer.music.load(file_path)       #加载文件，利用pygame进行播放音乐
+            pygame.mixer.music.play()
+            self.current_music_label.setText("正在播放: " + song["title"] + " - " + song["author"])
+            
+
+            #self.current_index = self.song_list.index(song)
+            
+        except pygame.error:
+            QMessageBox.warning(self, "错误", "该音乐文件损坏或者需要VIP")
+            self.play_error=True
+        self.timer.start(1000) 
+
+    
+        
+        
+    #暂停音乐
+    def pause_music(self):
+        pygame.mixer.music.pause()
+        self.paused = True
+        self.current_position = pygame.mixer.music.get_pos() #获取实时进度播放位置
+        self.is_playing = False
+        self.pause_button.setIcon(self.resume_icon)
+        
+        
+    #继续音乐
+    def resume_music(self):
+        if not self.is_playing:
+            pygame.mixer.music.unpause()
+            self.paused = False
+            self.pause_button.setIcon(self.pause_icon)
+            self.update_progress()                      #点击继续后的实时更新进度条
+            self.is_playing = True
+           # self.pause_button.setIcon(self.pause_icon)
+        
+
+    def adjust_volume(self):
+        value = self.volume_slider.value()
+        self.volume_label.setText("音量：" + str(value))
+        volume = value / 100
+        pygame.mixer.music.set_volume(volume)
+    
+    #整体的歌曲进度条显示
+    def update_progress(self):
+        if pygame.mixer.music.get_busy() or not self.paused and not self.play_error:
+            current_time = pygame.mixer.music.get_pos() // 1000     #获取当前音乐播放的位置，然后除以1000得到以秒为单位的时间
+            song = MP3(os.path.join("music", f"{self.current_song['title']}-{self.current_song['author']}.mp3"))          #利用mutagen直接转变成MP3
+            total_duration = math.floor(song.info.length)         #利用math库来计算歌曲总长度
+            self.progress_slider.setMaximum(total_duration)
+            self.progress_slider.setValue(current_time)
+
+            #用于实时确定进度条位置
+            current_position = pygame.mixer.music.get_pos() // 1000
+            self.progress_label.setText(str(current_position))
+            QTimer.singleShot(1000, self.update_progress)
+            
+            current_minutes = math.floor(current_time / 60)      #math.floor()函数用于向下取整，将除法运算的结果向下取整到最接近的整数。所以current_time / 60是将当前时间除以60，得到的结果是以分钟为单位的时间
+            current_seconds = current_time % 60                #分钟的显示，直接60的余数
+            
+            total_minutes = math.floor(total_duration / 60)
+            total_seconds = total_duration % 60
+            
+            self.progress_label.setText(f"{current_minutes:02d}:{current_seconds:02d} / {total_minutes:02d}:{total_seconds:02d}")      #格式化字符串使用了 f-string，其格式化为两位数的整数，不足两位时用0填充
+        else:
+            self.timer.stop()
+
+    #用于实时显示进度条时间，表示当前音频播放的进度值。函数首先检查音频播放是否被暂停（self.paused），如果没有被暂停，则更新音频的播放位置
+    def set_progress(self, value):
+        if not self.paused:
+            current_time = value
+            pygame.mixer.music.set_pos(current_time)
+    
+    #暂停→继续按钮
+    def pause_resume_music(self):
+        if self.is_playing:
+            self.pause_music()
+        else:
+            self.resume_music()
+    
+    #实时更新已下载歌曲表单
+    def update_downloaded_music_list(self):
+        self.downloaded_music_list.clear()
+        songs = self.db.get_all_songs()
+        for song in songs:
+            self.downloaded_music_list.addItem(f"{song[1]} - {song[2]}")
+    
+    #用于实现已下载歌曲表单的双击播放
+    def play_downloaded_music(self, item):
+        index = self.downloaded_music_list.indexFromItem(item).row()
+        self.current_index = index - 1  # 更新current_index的值，切换到上一首歌曲
+        if self.current_index < 0:  # 如果current_index小于0，则表示已经到达列表的第一首歌曲
+            self.current_index = len(self.db.get_all_songs()) - 1  # 将current_index设置为最后一首歌曲的索引
+        song_id = self.db.get_all_songs()[index][0]  # 获取歌曲的数据库 ID
+        song = self.db.get_song_by_id(song_id)  # 通过 ID 从数据库中获取歌曲信息
+        if song:
+            self.current_song_id = song_id
+            song_dict = {
+                "id":song[0],
+                "title": song[1],
+                "author": song[2],
+                "url": song[3]
+            }
+            self.play_music(song_dict) 
+    
+    #实现右键删除的菜单
+    def show_context_menu(self, position):
+        menu = QMenu(self)
+        index = self.downloaded_music_list.currentRow() #定义下标
+        song = self.db.get_all_songs()[index]
+
+        delete_action = menu.addAction("删除")
+        delete_action.triggered.connect(lambda: self.confirm_delete(song))  #将song作为参数传递给confirm_delete，在用户点击"删除"菜单项时，调用confirm_delete函数来确认删除选定的歌曲。
+        action = menu.exec_(self.downloaded_music_list.viewport().mapToGlobal(position))    #menu.exec_()方法是QMenu类的一个方法，它会阻塞程序的执行，直到用户选择了一个操作或关闭了菜单。 
+        if action == delete_action:
+            pass
+    
+    #弹出窗口，确认是否删除
+    def confirm_delete(self, song):
+        reply = QMessageBox.question(self, "确认删除", "确定要删除这首歌吗？", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            deleted_id = song[0]  # 获取要删除的歌曲的ID
+            file_path = os.path.join("music", f"{song[1]}-{song[2]}.mp3")  # 获取要删除的歌曲的文件路径
+            if os.path.exists(file_path):  # 判断文件是否存在
+                os.remove(file_path)  # 删除文件
+            self.db.cursor.execute("DELETE FROM songs WHERE id=?", (deleted_id,))
+            self.db.cursor.execute("UPDATE songs SET id=id-1 WHERE id>?", (deleted_id,))  # 更新表单的ID
+            self.db.cursor.execute("UPDATE sqlite_sequence SET seq=seq-1 WHERE name='songs'")  # 更新数据库的序列
+            self.db.conn.commit()
+            self.update_downloaded_music_list()
+        else:
+            pass
+    
+    #上一首歌曲
+    def play_previous_song(self):
+
+        if self.current_index is not None:
+            self.current_index -= 1  # 更新current_index的值，切换到上一首歌曲
+            if self.current_index < 0:  # 如果current_index小于0，则表示已经到达列表的第一首歌曲
+                self.current_index = len(self.db.get_all_songs()) - 1  # 将current_index设置为最后一首歌曲的索引
+            song_id = self.db.get_all_songs()[self.current_index][0]  # 获取歌曲的数据库 ID
+            song = self.db.get_song_by_id(song_id)  # 通过 ID 从数据库中获取歌曲信息
+            if song:
+                self.current_song_id = song_id
+                song_dict = {
+                    "id":song[0],
+                    "title": song[1],
+                    "author": song[2],
+                    "url": song[3]
+                }
+                self.play_music(song_dict)
+    
+    #下一首歌曲
+    def play_next_song(self):
+        if self.current_index is not None:
+            self.current_index += 1  # 更新current_index的值，切换到下一首歌曲
+            if self.current_index >= len(self.db.get_all_songs()):  # 如果current_index大于等于已下载歌曲列表的长度，则表示已经到达列表的最后一首歌曲
+                self.current_index = 0  # 将current_index设置为第一首歌曲的索引
+            song_id = self.db.get_all_songs()[self.current_index][0]  # 获取歌曲的数据库 ID
+            song = self.db.get_song_by_id(song_id)  # 通过 ID 从数据库中获取歌曲信息
+            if song:
+                self.current_song_id = song_id
+                song_dict = {
+                    "id":song[0],
+                    "title": song[1],
+                    "author": song[2],
+                    "url": song[3]
+                }
+                self.play_music(song_dict)
+
+    
+    
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MusicDownloader()
+    window.show()
+    sys.exit(app.exec_())
